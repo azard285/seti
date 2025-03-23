@@ -55,7 +55,7 @@ int main() {
         perror("listen");
         exit(EXIT_FAILURE);
     }
-
+    //Файловый дескриптор — это уникальный числовой идентификатор, который операционная система назначает каждому открытому файлу или ресурсу (сокету, каналу, устройству)
     fd_set readfds;
     int max_sd = server_fd;
 
@@ -73,7 +73,7 @@ int main() {
 
         int activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
 
-        if ((activity < 0) && (errno != EINTR)) {
+        if ((activity < 0)) {
             perror("select error");
         }
 
@@ -92,7 +92,7 @@ int main() {
         
         for (auto it = client_sockets.begin(); it != client_sockets.end(); ) {
             int sd = *it;
-            if (FD_ISSET(sd, &readfds)) {
+            if (FD_ISSET(sd, &readfds)) { //Проверяет, готов ли текущий клиентский сокет к чтению. Если да, это означает, что клиент отправил данные
                 int valread = read(sd, buffer, 1024);
                 if (valread == 0) {
                     
