@@ -162,7 +162,8 @@ std::string base64_encode(const std::string& input) {
 
 
 int main() {
-    std::string sender_email, recipient_email, subject, body, attachment_filename, app_password;
+    std::string sender_email, recipient_email, subject, body, file, app_password;
+    std::vector<std::string> attachment_filenames;
 
     
     std::cout << "Введите ваш email адрес (Gmail) (по умолчанию pavlenkopasa382@gmail.com): ";
@@ -195,7 +196,14 @@ int main() {
     std::getline(std::cin, body);
 
     std::cout << "Введите имя файла для вложения (или оставьте пустым, чтобы не вкладывать файл): ";
-    std::getline(std::cin, attachment_filename);
+    std::getline(std::cin, file);
+
+    while(!file.empty())
+    {
+        attachment_filenames.push_back(file);
+        std::cout << "Введите следующий файл или пропустите: ";
+        std::getline(std::cin, file);
+    }
 
 
     
@@ -316,27 +324,29 @@ int main() {
         message += "MIME-Version: 1.0\r\n";
 
         
-        if (!attachment_filename.empty()) {
-            std::string encoded_file = base64_encode_file(attachment_filename);
 
-            
-            std::string boundary = "----=_NextPart_001_" + std::to_string(time(0)); 
-            message += "Content-Type: multipart/mixed; boundary=\"" + boundary + "\"\r\n\r\n";
+                
+                std::string boundary = "----=_NextPart_001_" + std::to_string(time(0)); 
+                message += "Content-Type: multipart/mixed; boundary=\"" + boundary + "\"\r\n\r\n";
 
-            
-            message += "--" + boundary + "\r\n";
-            message += "Content-Type: text/plain; charset=UTF-8\r\n";
-            message += "Content-Transfer-Encoding: 8bit\r\n\r\n";
-            message += body + "\r\n\r\n";
+                
+                message += "--" + boundary + "\r\n";
+                message += "Content-Type: text/plain; charset=UTF-8\r\n";
+                message += "Content-Transfer-Encoding: 8bit\r\n\r\n";
+                message += body + "\r\n\r\n";
 
-            
-            message += "--" + boundary + "\r\n";
-            message += "Content-Type: application/octet-stream; name=\"" + attachment_filename + "\"\r\n";
-            message += "Content-Transfer-Encoding: base64\r\n";
-            message += "Content-Disposition: attachment; filename=\"" + attachment_filename + "\"\r\n\r\n";
-            message += encoded_file + "\r\n\r\n";
+                
+        if (!attachment_filenames.empty()) {
+            for(const auto &attachment_filename : attachment_filenames){
+                std::string encoded_file = base64_encode_file(attachment_filename);
+                message += "--" + boundary + "\r\n";
+                message += "Content-Type: application/octet-stream; name=\"" + attachment_filename + "\"\r\n";
+                message += "Content-Transfer-Encoding: base64\r\n";
+                message += "Content-Disposition: attachment; filename=\"" + attachment_filename + "\"\r\n\r\n";
+                message += encoded_file + "\r\n\r\n";
+            }
 
-            message += "--" + boundary + "--\r\n"; 
+                message += "--" + boundary + "--\r\n"; 
         } else {
             
             message += "Content-Type: text/plain; charset=UTF-8\r\n";

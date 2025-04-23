@@ -1,304 +1,361 @@
+// smtp_client_gmail_multiple_attachments.cpp
 #include <iostream>
 #include <string>
-#include <cstring>
-#include <fstream>
 #include <sstream>
+#include <fstream>
+#include <stdexcept>
 #include <vector>
+#include <iomanip>  // std::setw
+
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <netdb.h>
+#include <cstring> // memset
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <openssl/bio.h>
-#include <openssl/buffer.h>
-#include <openssl/evp.h>
 
 // Константы
-const std::string SERVER_ADDRESS = "pop.gmail.com"; // Замените на адрес вашего POP3 сервера
-const int SERVER_PORT = 995; // POP3S (SSL) порт. Используйте 110 для обычного POP3.
+const int SMTP_PORT = 465; // Gmail requires SSL on port 465 or STARTTLS on port 587
 const int BUFFER_SIZE = 4096;
-const int MAX_RETRIES = 3; // Максимальное количество попыток переподключения
+const std::string SMTP_SERVER = "smtp.gmail.com";
 
-// Функция для подключения к серверу
-int connect_to_server(const std::string& server_address, int server_port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        return -1;
+// Базовый класс исключения для упрощения обработки ошибок
+class SMTPException : public std::runtime_error {
+public:
+    explicit SMTPException(const std::string& message) : std::runtime_error(message) {}
+};
+
+// Функция для чтения ответа с сервера
+std::string read_response(SSL *ssl) {
+    char buffer[BUFFER_SIZE] = {0};
+    int bytes_received = SSL_read(ssl, buffer, BUFFER_SIZE - 1);
+    if (bytes_received < 0) {
+        throw SMTPException("Ошибка при чтении ответа от сервера: " + std::to_string(SSL_get_error(ssl, bytes_received)));
     }
-
-    sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(server_port);
-
-    if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0) {
-    std::cerr << "Invalid address/ Address not supported" << std::endl;
-    close(sock);
-    return -1;
+    return std::string(buffer, bytes_received);
 }
-
-
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("connect");
-        close(sock);
-        return -1;
-    }
-
-    return sock;
-}
-
 
 // Функция для отправки команды на сервер
-std::string send_command(int sock, const std::string& command) {
-    std::string command_with_newline = command + "\r\n";
-    if (send(sock, command_with_newline.c_str(), command_with_newline.length(), 0) < 0) {
-        perror("send");
-        return "";
+void send_command(SSL *ssl, const std::string& command) {
+    std::cout << "Клиент: " << command;
+    if (SSL_write(ssl, command.c_str(), command.length()) <= 0) {
+        throw SMTPException("Ошибка при отправке команды на сервер: " + std::to_string(SSL_get_error(ssl, 0)));
     }
-    char buffer[BUFFER_SIZE] = {0};
-    ssize_t bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0); // -1 чтобы было место для нуль-терминатора
-    if (bytes_received < 0) {
-        perror("recv");
-        return "";
-    }
-    buffer[bytes_received] = '\0'; // Обеспечиваем нуль-терминацию
-    return std::string(buffer);
 }
 
+// Функция для проверки кода ответа сервера
+void check_response_code(const std::string& response, int expected_code) {
+    int code;
+    std::stringstream ss(response);
+    ss >> code;
 
-// Base64 decoding function
-std::string base64_decode(const std::string& encoded_string) {
-    BIO *bio, *b64;
-    char *buffer = nullptr;
-    size_t length = encoded_string.length();
-    std::string decoded_string;
-
-    bio = BIO_new_mem_buf(encoded_string.c_str(), length);
-    b64 = BIO_new(BIO_f_base64());
-    bio = BIO_push(b64, bio);
-
-    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL); // Do not use newlines to flush buffer
-
-    int decoded_length = 0;
-    char* decoded = new char[length];
-    while ((decoded_length = BIO_read(bio, decoded, length)) > 0) {
-        decoded_string.append(decoded, decoded_length);
+    if (code != expected_code) {
+        std::cerr << "Ошибка: " << response << std::endl;
+        throw SMTPException("Неожиданный код ответа от сервера: " + std::to_string(code) + " Response: " + response);
     }
-
-    BIO_free_all(bio);
-    delete[] decoded;
-    return decoded_string;
 }
 
-
-
-// Функция для сохранения вложения в файл
-bool save_attachment(const std::string& filename, const std::string& content) {
-    std::ofstream outfile(filename, std::ios::binary);
-    if (!outfile.is_open()) {
-        std::cerr << "Error opening file for attachment: " << filename << std::endl;
-        return false;
+// Функция для кодирования в Base64
+std::string base64_encode_file(const std::string& filename) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        throw SMTPException("Не удалось открыть файл: " + filename);
     }
-    outfile.write(content.c_str(), content.length());
-    outfile.close();
-    std::cout << "Attachment saved to: " << filename << std::endl;
-    return true;
-}
 
+    std::string file_content((std::istreambuf_iterator<char>(file)),
+                              std::istreambuf_iterator<char>());
 
-// Функция для парсинга email и извлечения тела и вложений
-void parse_email(const std::string& email_content) {
-    std::stringstream email_stream(email_content);
-    std::string line;
-    bool in_body = false;
-    std::string body;
-    std::string boundary;
-    bool found_boundary = false;
+    const std::string base64_chars =
+             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+             "abcdefghijklmnopqrstuvwxyz"
+             "0123456789+/";
 
-    // Поиск boundary
-    while (std::getline(email_stream, line)) {
-        if (line.find("Content-Type:") != std::string::npos && line.find("multipart/mixed;") != std::string::npos) {
-            size_t pos = line.find("boundary=");
-            if (pos != std::string::npos) {
-                boundary = line.substr(pos + 9); // 9 = strlen("boundary=")
-                // Remove quotes, if any
-                if (boundary.front() == '"' && boundary.back() == '"') {
-                    boundary = boundary.substr(1, boundary.length() - 2);
-                }
-                found_boundary = true;
-                std::cout << "Found boundary: " << boundary << std::endl;
-                break;
-            }
+    std::string encoded_string;
+    int i = 0;
+    unsigned char char_array_3[3];
+    unsigned char char_array_4[4];
+
+    for (size_t pos = 0; pos < file_content.length(); pos++) {
+        char_array_3[i++] = file_content[pos];
+        if (i == 3) {
+            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+            char_array_4[3] = char_array_3[2] & 0x3f;
+
+            for (i = 0; (i < 4); i++)
+                encoded_string += base64_chars[char_array_4[i]];
+            i = 0;
         }
     }
 
-    if (!found_boundary) {
-        std::cout << "Simple email without attachments." << std::endl;
-         email_stream.seekg(0, std::ios::beg);
-         in_body = true;
-         while (std::getline(email_stream, line)) {
-                if (in_body) {
-                    body += line + "\n";
-                }
-                if (line.empty() || line == "\r") {
-                    in_body = true;
-                }
-            }
-             std::cout << "Email Body:\n" << body << std::endl;
-        return;
+    if (i)
+    {
+        for (int j = i; j < 3; j++)
+            char_array_3[j] = '\0';
+
+        char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+        char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+        char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+        char_array_4[3] = char_array_3[2] & 0x3f;
+
+        for (int j = 0; (j < i + 1); j++)
+            encoded_string += base64_chars[char_array_4[j]];
+
+        while((i++ < 3))
+            encoded_string += '=';
+
     }
 
-
-    std::string attachment_content;
-    std::string attachment_filename;
-    bool in_attachment = false;
-
-    email_stream.seekg(0, std::ios::beg); // Reset stream to the beginning
-
-    while (std::getline(email_stream, line)) {
-        if (line.find(boundary) != std::string::npos) {
-            in_attachment = true;
-            attachment_filename = "";
-            attachment_content = "";
-        } else if (in_attachment) {
-            if (line.find("Content-Disposition: attachment;") != std::string::npos) {
-                size_t filename_pos = line.find("filename=");
-                if (filename_pos != std::string::npos) {
-                    attachment_filename = line.substr(filename_pos + 9); //9 = strlen("filename=")
-                    // Remove quotes, if any
-                    if (attachment_filename.front() == '"' && attachment_filename.back() == '"') {
-                        attachment_filename = attachment_filename.substr(1, attachment_filename.length() - 2);
-                    }
-                    std::cout << "Found attachment filename: " << attachment_filename << std::endl;
-                }
-            } else if (line.find("Content-Transfer-Encoding: base64") != std::string::npos) {
-                // Read attachment content
-                std::string encoded_content;
-                while (std::getline(email_stream, line)) {
-                    if (line.find(boundary) != std::string::npos) {
-                        break;
-                    }
-                    encoded_content += line;
-                }
-
-                attachment_content = base64_decode(encoded_content);
-                if (!attachment_filename.empty()) {
-                    save_attachment(attachment_filename, attachment_content);
-                } else {
-                    std::cout << "Attachment found, but filename is missing." << std::endl;
-                }
-                in_attachment = false;
-
-
-            } else {
-                 if (line.empty() || line == "\r") {
-                    in_body = true;
-                }
-                if(in_body){
-                    body+= line + "\n";
-                }
-            }
-        }else {
-             if (line.empty() || line == "\r") {
-                    in_body = true;
-                }
-                if(in_body){
-                    body+= line + "\n";
-                }
-
-        }
-    }
-     std::cout << "Email Body:\n" << body << std::endl;
+    return encoded_string;
 }
 
+std::string base64_encode(const std::string& input) {
+    const std::string base64_chars =
+             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+             "abcdefghijklmnopqrstuvwxyz"
+             "0123456789+/";
 
+    std::string encoded_string;
+    int i = 0;
+    unsigned char char_array_3[3];
+    unsigned char char_array_4[4];
 
+    for (size_t pos = 0; pos < input.length(); pos++) {
+        char_array_3[i++] = input[pos];
+        if (i == 3) {
+            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+            char_array_4[3] = char_array_3[2] & 0x3f;
+
+            for (i = 0; (i < 4); i++)
+                encoded_string += base64_chars[char_array_4[i]];
+            i = 0;
+        }
+    }
+
+    if (i)
+    {
+        for (int j = i; j < 3; j++)
+            char_array_3[j] = '\0';
+
+        char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+        char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+        char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+        char_array_4[3] = char_array_3[2] & 0x3f;
+
+        for (int j = 0; (j < i + 1); j++)
+            encoded_string += base64_chars[char_array_4[j]];
+
+        while((i++ < 3))
+            encoded_string += '=';
+
+    }
+
+    return encoded_string;
+}
 
 int main() {
-    std::string username, password;
-    int sock = -1;
-    int retries = 0;
+    std::string sender_email, recipient_email, subject, body, app_password;
+    std::vector<std::string> attachment_filenames;
 
-    std::cout << "Enter username: ";
-    std::cin >> username;
-    std::cout << "Enter password: ";
-    std::cin >> password;
+    // Запрашиваем параметры подключения и письма у пользователя
+    std::cout << "Введите ваш email адрес (Gmail): ";
+    std::cin >> sender_email;
+    std::cout << "Введите пароль приложения (Gmail): ";
+    std::cin >> app_password; //Важно: используйте пароль приложения!
+    std::cout << "Введите email адрес получателя: ";
+    std::cin >> recipient_email;
+    std::cout << "Введите тему письма: ";
+    std::cin.ignore(); // Очистить буфер после ввода email
+    std::getline(std::cin, subject);
+    std::cout << "Введите текст письма: ";
+    std::getline(std::cin, body);
 
-    while (sock == -1 && retries < MAX_RETRIES) {
-        sock = connect_to_server(SERVER_ADDRESS, SERVER_PORT);
-        if (sock == -1) {
-            std::cerr << "Failed to connect. Retrying in 5 seconds..." << std::endl;
-            retries++;
-            sleep(5); // Ждем 5 секунд перед повторной попыткой
+    // Запрашиваем имена файлов для вложений
+    std::string filename;
+    while (true) {
+        std::cout << "Введите имя файла для вложения (или оставьте пустым для завершения): ";
+        std::getline(std::cin, filename);
+        if (filename.empty()) {
+            break;
         }
+        attachment_filenames.push_back(filename);
     }
 
-    if (sock == -1) {
-        std::cerr << "Failed to connect after " << MAX_RETRIES << " retries. Exiting." << std::endl;
+
+    // Инициализация OpenSSL
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+
+    const SSL_METHOD *method = TLS_client_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        ERR_print_errors_fp(stderr);
+        throw SMTPException("Не удалось создать SSL context");
+    }
+
+
+    int socket_desc = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_desc == -1) {
+        std::cerr << "Не удалось создать сокет." << std::endl;
         return 1;
     }
 
-
-    std::string response = send_command(sock, "USER " + username);
-    std::cout << "Server response: " << response << std::endl;
-    if (response.substr(0, 3) != "+OK") {
-        std::cerr << "Authentication failed (USER)." << std::endl;
-        close(sock);
+    struct hostent *server = gethostbyname(SMTP_SERVER.c_str());
+    if (server == nullptr) {
+        std::cerr << "Не удалось разрешить имя хоста." << std::endl;
+        close(socket_desc);
+        SSL_CTX_free(ctx);
         return 1;
     }
 
-    response = send_command(sock, "PASS " + password);
-    std::cout << "Server response: " << response << std::endl;
-    if (response.substr(0, 3) != "+OK") {
-        std::cerr << "Authentication failed (PASS)." << std::endl;
-        close(sock);
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(SMTP_PORT);
+    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+
+
+    if (connect(socket_desc, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        std::cerr << "Не удалось подключиться к серверу." << std::endl;
+        close(socket_desc);
+        SSL_CTX_free(ctx);
         return 1;
     }
 
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) {
+        ERR_print_errors_fp(stderr);
+        close(socket_desc);
+        SSL_CTX_free(ctx);
+        return 1;
+    }
 
-    response = send_command(sock, "STAT");
-    std::cout << "Server response: " << response << std::endl;
+    SSL_set_fd(ssl, socket_desc);
 
-    // Получаем количество писем
-    std::stringstream ss(response);
-    std::string ok, num_messages_str, total_size_str;
-    ss >> ok >> num_messages_str >> total_size_str;
+    if (SSL_connect(ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        close(socket_desc);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return 1;
+    }
 
-    int num_messages = std::stoi(num_messages_str);
+    try {
+        // 1. Приветствие сервера
+        std::string response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 220);
 
-    std::cout << "You have " << num_messages << " messages." << std::endl;
+        // 2. EHLO
+        send_command(ssl, "EHLO example.com\r\n");
+        response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 250);
 
+        // 3. Аутентификация
+        send_command(ssl, "AUTH LOGIN\r\n");
+        response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 334);
 
-    for (int i = 1; i <= num_messages; ++i) {
-        std::cout << "Fetching message " << i << std::endl;
-        response = send_command(sock, "RETR " + std::to_string(i));
-        if (response.substr(0, 3) == "+OK") {
-            // Extract the email content
-            std::string email_content;
-            std::string line;
-            std::stringstream response_stream(response);
+        // Отправка имени пользователя (email)
+        std::string encoded_username = base64_encode(sender_email);
+        send_command(ssl, encoded_username + "\r\n");
+        response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 334);
 
-            // Skip the first line (+OK ...)
-            std::getline(response_stream, line);
+        // Отправка пароля приложения
+        std::string encoded_password = base64_encode(app_password);
+        send_command(ssl, encoded_password + "\r\n");
+        response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 235);
 
-            // Read the rest of the email
-            while (std::getline(std::cin, line)) {
-                if (line == ".") {
-                    break;
-                }
-                email_content += line + "\n";
-            }
+        // 4. MAIL FROM
+        send_command(ssl, "MAIL FROM:<" + sender_email + ">\r\n");
+        response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 250);
 
-            parse_email(email_content);
+        // 5. RCPT TO
+        send_command(ssl, "RCPT TO:<" + recipient_email + ">\r\n");
+        response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 250);
 
-            // Delete the message (optional)
-            // send_command(sock, "DELE " + std::to_string(i));
-        } else {
-            std::cerr << "Error retrieving message " << i << std::endl;
+        // 6. DATA
+        send_command(ssl, "DATA\r\n");
+        response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 354);
+
+        // 7. Формирование заголовков и тела письма
+        std::string message;
+        message += "Date: Mon, 15 Nov 2023 14:30:00 +0000\r\n"; // Пример даты, можно сгенерировать динамически
+        message += "From: <" + sender_email + ">\r\n";
+        message += "To: <" + recipient_email + ">\r\n";
+        message += "Subject: " + subject + "\r\n";
+        message += "MIME-Version: 1.0\r\n";
+
+        // MIME boundary для разделения частей письма
+        std::string boundary = "----=_NextPart_001_" + std::to_string(time(0)); // Уникальный разделитель
+        message += "Content-Type: multipart/mixed; boundary=\"" + boundary + "\"\r\n\r\n";
+
+        // Текстовая часть письма
+        message += "--" + boundary + "\r\n";
+        message += "Content-Type: text/plain; charset=UTF-8\r\n";
+        message += "Content-Transfer-Encoding: 8bit\r\n\r\n";
+        message += body + "\r\n\r\n";
+
+        // Части с вложениями
+        for (const auto& attachment_filename : attachment_filenames) {
+            std::string encoded_file = base64_encode_file(attachment_filename);
+
+            message += "--" + boundary + "\r\n";
+            message += "Content-Type: application/octet-stream; name=\"" + attachment_filename + "\"\r\n";
+            message += "Content-Transfer-Encoding: base64\r\n";
+            message += "Content-Disposition: attachment; filename=\"" + attachment_filename + "\"\r\n\r\n";
+            message += encoded_file + "\r\n\r\n";
         }
+
+        message += "--" + boundary + "--\r\n"; // Закрывающий boundary
+
+        // 8. Отправка данных
+        send_command(ssl, message + "\r\n.\r\n"); // Важно:  "\r\n.\r\n" - окончание DATA
+        response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 250);
+
+        // 9. QUIT
+        send_command(ssl, "QUIT\r\n");
+        response = read_response(ssl);
+        std::cout << "Сервер: " << response << std::endl;
+        check_response_code(response, 221);
+
+    } catch (const SMTPException& e) {
+        std::cerr << "Ошибка SMTP: " << e.what() << std::endl;
+        ERR_print_errors_fp(stderr);
+    } catch (const std::exception& e) {
+        std::cerr << "Общая ошибка: " << e.what() << std::endl;
+        ERR_print_errors_fp(stderr);
     }
 
-    send_command(sock, "QUIT");
-    close(sock);
+    // Очистка OpenSSL
+    SSL_shutdown(ssl);
+    close(socket_desc);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    EVP_cleanup();
+    CRYPTO_cleanup_all_ex_data();
+    ERR_free_strings();
 
     return 0;
 }
